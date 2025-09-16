@@ -9,7 +9,6 @@ env/
 
 # Environment configs (keep secrets safe)
 .env
-.env.*
 
 # Logs
 *.log
