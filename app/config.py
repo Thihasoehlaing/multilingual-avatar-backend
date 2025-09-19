@@ -28,13 +28,16 @@ class Settings(BaseSettings):
     MONGO_AUTH_SOURCE: str = "admin"
 
     # AWS
-    AWS_REGION: str = "ap-southeast-1"
+    AWS_ACCESS_KEY_ID: str | None = None
+    AWS_SECRET_ACCESS_KEY: str | None = None
+    AWS_SESSION_TOKEN: str | None = None
+    AWS_REGION: str = "ap-southeast-5"
     AWS_S3_BUCKET_AUDIO: str = "avatar-audio-cache"
     POLLY_VOICE_MALE: str = "Matthew"
     POLLY_VOICE_FEMALE: str = "Joanna"
 
     # Load from .env file
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     # Security / Limits
     MAX_TTS_TEXT_LEN: int = 500         # prevent abuse & big bills
