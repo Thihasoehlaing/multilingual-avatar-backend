@@ -1,7 +1,6 @@
-from typing import List, Union
+from typing import List, Union, Optional
 from pydantic import AnyHttpUrl, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
-
 
 class Settings(BaseSettings):
     # App
@@ -27,23 +26,28 @@ class Settings(BaseSettings):
     MONGO_PASSWORD: str
     MONGO_AUTH_SOURCE: str = "admin"
 
-    # AWS
-    AWS_ACCESS_KEY_ID: str | None = None
-    AWS_SECRET_ACCESS_KEY: str | None = None
-    AWS_SESSION_TOKEN: str | None = None
+    # AWS core
+    AWS_ACCESS_KEY_ID: Optional[str] = None
+    AWS_SECRET_ACCESS_KEY: Optional[str] = None
+    AWS_SESSION_TOKEN: Optional[str] = None
     AWS_REGION: str = "ap-southeast-5"
     AWS_S3_BUCKET_AUDIO: str = "avatar-audio-cache"
+
+    # Polly fallback voices by gender
     POLLY_VOICE_MALE: str = "Matthew"
     POLLY_VOICE_FEMALE: str = "Joanna"
 
-    # Load from .env file
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
-
     # Security / Limits
-    MAX_TTS_TEXT_LEN: int = 500         # prevent abuse & big bills
-    RATE_TTS_PER_MIN: int = 12          # per-user per-minute
-    RATE_AUTH_PER_MIN: int = 20         # signup/login bursts
-    TRUSTED_HOSTS: list[str] = ["127.0.0.1", "localhost"]  # add your EC2 DNS later
+    MAX_TTS_TEXT_LEN: int = 500
+    RATE_TTS_PER_MIN: int = 12
+    RATE_AUTH_PER_MIN: int = 20
+    TRUSTED_HOSTS: list[str] = ["127.0.0.1", "localhost"]
 
+    # Meta
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore"
+    )
 
 settings = Settings()

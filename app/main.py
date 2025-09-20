@@ -1,7 +1,8 @@
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.middleware.gzip import GZipMiddleware
+from fastapi.exceptions import RequestValidationError
 
 from app.config import settings
 from app.db.mongo import connect_to_mongo, close_mongo_connection
@@ -21,15 +22,12 @@ from app.utils.errors import (
     handle_rate_limit,
     handle_unhandled,
 )
-from fastapi.exceptions import RequestValidationError
-from fastapi import HTTPException
 
-# Routers
+# Routers you actively use
 from app.auth.routes import router as auth_router
 from app.users.routes import router as users_router
-from app.sessions.routes import router as sessions_router
 from app.tts.routes import router as tts_router
-
+from app.avatar.routes import router as avatar_router
 
 def create_app() -> FastAPI:
     app = FastAPI(
@@ -40,34 +38,26 @@ def create_app() -> FastAPI:
     )
 
     # ----- Middleware -----
-    # Host allowlist
     app.add_middleware(
         TrustedHostMiddleware,
-        allowed_hosts=(
-            settings.TRUSTED_HOSTS + ["*"] if settings.APP_ENV == "dev" else settings.TRUSTED_HOSTS
-        ),
+        allowed_hosts=(settings.TRUSTED_HOSTS + ["*"] if settings.APP_ENV == "dev" else settings.TRUSTED_HOSTS),
     )
-
-    # Security headers
     app.add_middleware(SecurityHeadersMiddleware)
-
-    # GZip large responses (e.g., viseme arrays)
     app.add_middleware(GZipMiddleware, minimum_size=1024)
 
-    # Rate limiting
     app.state.limiter = limiter
     app.add_middleware(SlowAPIMiddleware)
 
-    # CORS (keep strict; expand when you host the frontend)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=[str(o) for o in settings.ALLOW_ORIGINS],
         allow_credentials=True,
-        allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-        allow_headers=["Authorization", "Content-Type"],
+        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+        allow_headers=["Authorization", "Content-Type", "Accept", "Range"],
+        expose_headers=["X-Request-Id", "Content-Range", "Accept-Ranges"],
+        max_age=86400,
     )
 
-    # Per-request id for logging correlation
     @app.middleware("http")
     async def add_request_id(request: Request, call_next):
         import uuid
@@ -79,13 +69,13 @@ def create_app() -> FastAPI:
         response.headers["X-Request-Id"] = request_id_ctx.get() or "-"
         return response
 
-    # ----- Exception Handlers (unify JSON error shapes) -----
+    # ----- Exception Handlers -----
     app.add_exception_handler(HTTPException, handle_http_exception)
     app.add_exception_handler(RequestValidationError, handle_validation_error)
     app.add_exception_handler(RateLimitExceeded, handle_rate_limit)
     app.add_exception_handler(Exception, handle_unhandled)
 
-    # ----- Lifecycle: DB connect / indexes / close -----
+    # ----- Lifecycle -----
     @app.on_event("startup")
     async def _startup():
         await connect_to_mongo(app)
@@ -97,7 +87,7 @@ def create_app() -> FastAPI:
         await close_mongo_connection(app)
         logger.info("Shutdown complete")
 
-    # ----- Health check -----
+    # ----- Health -----
     @app.get("/healthz", tags=["system"])
     async def healthz():
         db = getattr(app.state, "db", None)
@@ -108,7 +98,6 @@ def create_app() -> FastAPI:
                 mongo_ok = True
             except Exception:
                 mongo_ok = False
-
         return {
             "status": "ok" if mongo_ok else "degraded",
             "db": mongo_ok,
@@ -119,11 +108,10 @@ def create_app() -> FastAPI:
 
     # ----- Routers -----
     app.include_router(auth_router, prefix="/auth", tags=["auth"])
-    app.include_router(users_router, prefix="/users", tags=["users"])
-    app.include_router(sessions_router, prefix="/sessions", tags=["sessions"])
-    app.include_router(tts_router, prefix="/tts", tags=["tts"])
+    app.include_router(users_router)             # /users/me, /users/me (PATCH)
+    app.include_router(tts_router)               # /tts/voices, /tts/choose, /tts/say
+    app.include_router(avatar_router)            # /avatar/config, /avatar/speak/*
 
     return app
-
 
 app = create_app()

@@ -1,6 +1,7 @@
 from pydantic import BaseModel, EmailStr, Field
-from typing import Optional, Literal
+from typing import Optional, Literal, Dict
 
+# Only two avatars in your app
 Gender = Literal["male", "female"]
 
 class UserCreate(BaseModel):
@@ -13,9 +14,11 @@ class UserPublic(BaseModel):
     email: EmailStr
     full_name: Optional[str] = None
     gender: Optional[Gender] = None
-    voice_pref: Optional[str] = None
+    # Per-language voice overrides: { "en-US": "Matthew", "zh-CN": "Zhiyu" }
+    voice_overrides: Dict[str, str] = {}
 
 class UserUpdate(BaseModel):
     full_name: Optional[str] = None
     gender: Optional[Gender] = None
-    voice_pref: Optional[str] = None
+    # Upsert/replace the whole dict (simplest). If you want granular patching, add another route.
+    voice_overrides: Optional[Dict[str, str]] = None

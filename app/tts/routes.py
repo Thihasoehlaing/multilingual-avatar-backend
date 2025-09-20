@@ -1,60 +1,48 @@
-from fastapi import APIRouter, Depends, Request
+from __future__ import annotations
+from typing import Optional
+from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
-from typing import Optional, Literal, Dict, Any
 
 from app.deps import get_current_user
-from app.tts.services import tts_pipeline
-
-from app.utils.rate_limit import limiter
-from app.utils.response import success
-from app.utils.errors import BadRequestError
-from app.utils.origin_guard import enforce_origin
+from app.utils.response import success, fail
+from app.users.crud import update_profile
 from app.config import settings
+from .services import (
+    list_polly_voices,
+    is_voice_available,
+    translate_text,
+    synthesize_with_visemes,
+)
 
-# Keep target/source codes consistent with your sessions model
-SourceLang = Literal["en-US", "ms-MY", "zh-CN"]
-TargetLang = Literal[
-    "en-US", "cmn-CN", "ja-JP", "ko-KR", "es-ES", "fr-FR",
-    "it-IT", "pt-PT", "ru-RU", "de-DE", "hi-IN", "ta-IN"
-]
+router = APIRouter(prefix="/tts", tags=["tts"])
 
-router = APIRouter()
+class SayIn(BaseModel):
+    text: str = Field(..., max_length=settings.MAX_TTS_TEXT_LEN)
+    current_lang: Optional[str] = None
+    target_lang: str
 
-class TtsRequest(BaseModel):
-    text: str = Field(min_length=1)
-    target_lang: TargetLang
-    source_lang: Optional[SourceLang] = None
-    voice: Optional[str] = None  # e.g. Polly voice id like "Matthew", "Joanna"
+@router.get("/voices")
+async def get_voices(lang: Optional[str] = None, neural_only: bool = True, current_user=Depends(get_current_user)):
+    return success({"voices": list_polly_voices(lang=lang, require_neural=neural_only)})
 
-@router.post("", summary="Text → Speech with visemes")
-@limiter.limit(f"{settings.RATE_TTS_PER_MIN}/minute")
-async def tts(
-    request: Request,
-    req: TtsRequest,
-    current_user = Depends(get_current_user),
-    _=Depends(enforce_origin),   # simple origin guard
-) -> Dict[str, Any]:
-    """
-    Returns base64 MP3 + viseme/word timeline for client-side lip-sync & captions.
-    """
-    text = req.text.strip()
-    if not text:
-        raise BadRequestError("Empty text")
-    if len(text) > settings.MAX_TTS_TEXT_LEN:
-        raise BadRequestError(f"Text too long (>{settings.MAX_TTS_TEXT_LEN} chars)")
+@router.post("/choose")
+async def choose_voice(voice_id: str, lang: Optional[str] = None, current_user=Depends(get_current_user)):
+    if not is_voice_available(voice_id, lang=lang):
+        return fail("VOICE_NOT_AVAILABLE", f"Voice '{voice_id}' not available in this region.")
+    await update_profile(current_user["_db"], current_user["_id"], {"voice_pref": voice_id})
+    return success({"voice_pref": voice_id})
 
-    user_voice_pref = current_user.get("voice_pref")
+@router.post("/say")
+async def say(body: SayIn, current_user=Depends(get_current_user)):
+    # Translate (if needed) from current_lang to target_lang
+    text_t = translate_text(body.text.strip(), source_lang=body.current_lang, target_lang=body.target_lang)
 
-    try:
-        result = tts_pipeline(
-            text=text,
-            user_voice_pref=user_voice_pref,
-            target_lang=req.target_lang,
-            source_lang=req.source_lang,
-            override_voice=req.voice,
-        )
-    except Exception as e:
-        # Clean fail instead of leaking internals
-        raise BadRequestError(f"TTS failed: {type(e).__name__}")
+    # pick voice: user preference → gender default
+    voice = current_user.get("voice_pref")
+    if not voice:
+        voice = settings.POLLY_VOICE_MALE if current_user.get("gender") == "male" else settings.POLLY_VOICE_FEMALE
+    if not is_voice_available(voice, lang=body.target_lang):
+        voice = settings.POLLY_VOICE_FEMALE
 
-    return success(result)
+    out = synthesize_with_visemes(text_t, voice_id=voice)
+    return success(out)

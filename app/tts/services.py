@@ -1,111 +1,178 @@
-import base64
-import json
-from typing import Dict, Any, List, Optional
+from __future__ import annotations
+import base64, json, time, io, uuid
+from typing import Optional, List, Dict
 
 import boto3
 from botocore.config import Config
+from botocore.exceptions import BotoCoreError, ClientError
 
 from app.config import settings
-from app.tts.viseme_map import to_morph
 
+# ---------- boto3 clients ----------
+def _session_kwargs(region: str):
+    kw = {"region_name": region}
+    if settings.AWS_ACCESS_KEY_ID and settings.AWS_SECRET_ACCESS_KEY:
+        kw.update(
+            aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
+            aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
+            aws_session_token=settings.AWS_SESSION_TOKEN,
+        )
+    return kw
 
-# One-time clients
-_boto_cfg = Config(region_name=settings.AWS_REGION)
-_polly = boto3.client("polly", config=_boto_cfg)
-_translate = boto3.client("translate", config=_boto_cfg)
+def _polly():
+    return boto3.client("polly", config=Config(retries={"max_attempts": 3}), **_session_kwargs(settings.AWS_REGION))
 
+def _translate():
+    return boto3.client("translate", config=Config(retries={"max_attempts": 3}), **_session_kwargs(settings.AWS_REGION))
+
+def _s3():
+    return boto3.client("s3", config=Config(retries={"max_attempts": 3}), **_session_kwargs(settings.AWS_REGION))
+
+def _transcribe():
+    return boto3.client("transcribe", config=Config(retries={"max_attempts": 3}), **_session_kwargs(settings.AWS_REGION))
+
+# ---------- Voice catalog ----------
+_VOICE_CACHE = {"ttl": 0, "data": []}
+_VOICE_TTL_SECONDS = 3600
+
+def list_polly_voices(lang: Optional[str] = None, require_neural: bool = True) -> List[Dict]:
+    now = int(time.time())
+    if now >= _VOICE_CACHE["ttl"]:
+        polly = _polly()
+        token = None
+        voices: List[Dict] = []
+        while True:
+            resp = polly.describe_voices(NextToken=token) if token else polly.describe_voices()
+            for v in resp.get("Voices", []):
+                voices.append({
+                    "id": v["Id"],
+                    "gender": v.get("Gender"),
+                    "languages": v.get("LanguageCodes", []),
+                    "engines": v.get("SupportedEngines", []),
+                })
+            token = resp.get("NextToken")
+            if not token:
+                break
+        _VOICE_CACHE["ttl"] = now + _VOICE_TTL_SECONDS
+        _VOICE_CACHE["data"] = voices
+
+    out = _VOICE_CACHE["data"]
+    if lang:
+        out = [v for v in out if lang in (v.get("languages") or [])]
+    if require_neural:
+        out = [v for v in out if "neural" in (v.get("engines") or [])]
+    return sorted(out, key=lambda x: (x["languages"], x["gender"], x["id"]))
+
+def is_voice_available(voice_id: str, lang: Optional[str] = None) -> bool:
+    voices = list_polly_voices(lang=lang, require_neural=False)
+    return any(v["id"] == voice_id for v in voices)
+
+# ---------- Translate lang map ----------
+_TRANSLATE_CODE_MAP = {
+    "en":"en","en-US":"en","en-GB":"en",
+    "ms":"ms","ms-MY":"ms",
+    "zh":"zh","zh-CN":"zh",
+    "ja":"ja","ja-JP":"ja",
+    "ko":"ko","ko-KR":"ko",
+    "es":"es","es-ES":"es",
+    "fr":"fr","fr-FR":"fr",
+    "it":"it","it-IT":"it",
+    "pt":"pt","pt-PT":"pt",
+    "ru":"ru","ru-RU":"ru",
+    "de":"de","de-DE":"de",
+    "hi":"hi","hi-IN":"hi",
+    "ta":"ta","ta-IN":"ta",
+}
+def _to_translate(code: Optional[str]) -> Optional[str]:
+    return _TRANSLATE_CODE_MAP.get(code, code) if code else None
 
 def translate_text(text: str, source_lang: Optional[str], target_lang: str) -> str:
-    """
-    Use Amazon Translate to get target text when source_lang is provided
-    and differs from target. If source_lang is None, treat as same-language.
-    """
     if not text:
         return text
-    if source_lang and source_lang != target_lang:
-        resp = _translate.translate_text(
-            Text=text,
-            SourceLanguageCode=source_lang,
-            TargetLanguageCode=target_lang,
-        )
-        return resp["TranslatedText"]
-    # No translation needed
+    tl = _to_translate(target_lang)
+    sl = _to_translate(source_lang) or "auto"
+    if not tl:
+        return text
+    resp = _translate().translate_text(Text=text, SourceLanguageCode=sl, TargetLanguageCode=tl)
+    return resp["TranslatedText"]
+
+# ---------- Transcribe (upload to S3 + batch job + poll) ----------
+# NOTE: This is simple and reliable for <60s clips. For live use, you'd do streaming Transcribe.
+def transcribe_wav_bytes(wav_bytes: bytes, media_format: str, language_code: str, timeout_sec: int = 60) -> str:
+    """
+    Upload the audio to S3, start a batch TranscriptionJob, poll for completion,
+    download the transcript JSON and return the transcript string.
+    """
+    s3 = _s3()
+    transcribe = _transcribe()
+
+    key = f"transcribe/{uuid.uuid4().hex}.{media_format or 'wav'}"
+    s3.put_object(Bucket=settings.AWS_S3_BUCKET_AUDIO, Key=key, Body=wav_bytes, ContentType=f"audio/{media_format or 'wav'}")
+
+    job_name = f"job-{uuid.uuid4().hex}"
+    media_uri = f"s3://{settings.AWS_S3_BUCKET_AUDIO}/{key}"
+    transcribe.start_transcription_job(
+        TranscriptionJobName=job_name,
+        LanguageCode=language_code,
+        MediaFormat=media_format or "wav",
+        Media={"MediaFileUri": media_uri},
+        OutputBucketName=settings.AWS_S3_BUCKET_AUDIO,
+        OutputKey=f"transcribe/{job_name}/"
+    )
+
+    # Poll
+    start = time.time()
+    while True:
+        st = transcribe.get_transcription_job(TranscriptionJobName=job_name)
+        status = st["TranscriptionJob"]["TranscriptionJobStatus"]
+        if status == "COMPLETED":
+            break
+        if status == "FAILED":
+            raise RuntimeError(f"Transcription failed: {st}")
+        if time.time() - start > timeout_sec:
+            raise TimeoutError("Transcription timed out")
+        time.sleep(2.0)
+
+    # Download transcript JSON from S3
+    out_key = f"transcribe/{job_name}/{job_name}.json"
+    obj = s3.get_object(Bucket=settings.AWS_S3_BUCKET_AUDIO, Key=out_key)
+    data = json.loads(obj["Body"].read().decode("utf-8"))
+    text = data["results"]["transcripts"][0]["transcript"].strip()
     return text
 
+# ---------- Polly synth + visemes ----------
+def synthesize_with_visemes(text: str, voice_id: str):
+    polly = _polly()
 
-def synthesize_with_visemes(text: str, voice_id: str = "Joanna") -> Dict[str, Any]:
-    """
-    Call Polly Neural TTS for audio and Speech Marks for visemes+words.
-    Returns: { "audioBase64": str, "visemes": List[Dict], "sampleRate": int }
-    """
-    # Audio
-    audio_resp = _polly.synthesize_speech(
+    # 1) Audio
+    audio = polly.synthesize_speech(
         Text=text,
         VoiceId=voice_id,
         Engine="neural",
         OutputFormat="mp3",
     )
-    audio_bytes = audio_resp["AudioStream"].read()
-    audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
+    audio_bytes = audio["AudioStream"].read()
 
-    # Speech marks (viseme + word)
-    marks_resp = _polly.synthesize_speech(
+    # 2) SpeechMarks (visemes)
+    marks = polly.synthesize_speech(
         Text=text,
         VoiceId=voice_id,
         Engine="neural",
         OutputFormat="json",
-        SpeechMarkTypes=["viseme", "word"],
+        SpeechMarkTypes=["viseme"],
     )
-    marks_lines = marks_resp["AudioStream"].read().decode("utf-8").splitlines()
 
-    visemes: List[Dict[str, Any]] = []
-    for line in marks_lines:
+    visemes = []
+    for line in io.TextIOWrapper(marks["AudioStream"], encoding="utf-8"):
         try:
-            item = json.loads(line)
-        except json.JSONDecodeError:
+            obj = json.loads(line.strip())
+            # "time" in ms, "value" is coarse viseme symbol (map this in your frontend/mapper)
+            visemes.append({"t": obj.get("time", 0)/1000.0, "morph": obj.get("value")})
+        except Exception:
             continue
-        t = item.get("type")
-        if t == "viseme":
-            # Polly fields: {"time":123,"type":"viseme","value":"p"}
-            visemes.append({
-                "type": "viseme",
-                "time": item.get("time", 0),            # ms
-                "value": item.get("value"),
-                "morph": to_morph(item.get("value", ""))  # normalized for avatar
-            })
-        elif t == "word":
-            # useful for captions / karaoke
-            # {"time":456,"type":"word","value":"hello","start":456,"end":600}
-            visemes.append({
-                "type": "word",
-                "time": item.get("time", 0),
-                "value": item.get("value")
-            })
 
-    # Polly MP3 default sample rate is usually 22050 or 24000 depending on voice; expose a common value
     return {
-        "audioBase64": audio_b64,
+        "audio_b64": base64.b64encode(audio_bytes).decode("utf-8"),
+        "mime": "audio/mpeg",
         "visemes": visemes,
-        "sampleRate": 22050
     }
-
-
-def tts_pipeline(
-    text: str,
-    user_voice_pref: Optional[str],
-    target_lang: str,
-    source_lang: Optional[str] = None,
-    override_voice: Optional[str] = None,
-) -> Dict[str, Any]:
-    """
-    High-level: translate (if needed) → synthesize with selected voice.
-    Voice priority: override_voice > user_voice_pref > defaults by gender (handled at route level).
-    """
-    # 1) Translate if source_lang provided and different
-    final_text = translate_text(text, source_lang=source_lang, target_lang=target_lang)
-
-    # 2) Voice choice
-    voice = override_voice or user_voice_pref or settings.POLLY_VOICE_FEMALE
-
-    # 3) Synthesize + visemes
-    return synthesize_with_visemes(final_text, voice_id=voice)
