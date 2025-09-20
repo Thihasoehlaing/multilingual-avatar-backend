@@ -13,28 +13,32 @@ from app.config import settings
 
 router = APIRouter()
 
+
 class SignupRequest(BaseModel):
     email: EmailStr
     password: str = Field(min_length=6)  # simple guard for demo
     full_name: str | None = None
 
+
 class LoginRequest(BaseModel):
     email: EmailStr
     password: str = Field(min_length=1)
 
+
 def _normalize_email(email: str) -> str:
     return str(email).strip().lower()
 
+
 @router.post("/signup")
 @limiter.limit(f"{settings.RATE_AUTH_PER_MIN}/minute")
-async def signup(request: Request, payload: SignupRequest, db = Depends(get_db)):
+async def signup(request: Request, payload: SignupRequest, db=Depends(get_db)):
     email = _normalize_email(payload.email)
-    if len(payload.password) < 6:  # explicit, readable check
+    if len(payload.password) < 6:
         raise BadRequestError("Password too short (min 6)")
 
     existing = await users_crud.get_by_email(db, email)
     if existing:
-        # Keep message generic to avoid account enumeration patterns
+        # Keep generic to avoid account enumeration
         raise BadRequestError("Email not available")
 
     user_id = str(uuid4())
@@ -44,9 +48,10 @@ async def signup(request: Request, payload: SignupRequest, db = Depends(get_db))
     token = create_access_token(subject=user_id, extra_claims={"email": email})
     return success({"token": token})
 
+
 @router.post("/login")
 @limiter.limit(f"{settings.RATE_AUTH_PER_MIN*2}/minute")
-async def login(request: Request, payload: LoginRequest, db = Depends(get_db)):
+async def login(request: Request, payload: LoginRequest, db=Depends(get_db)):
     email = _normalize_email(payload.email)
     user = await users_crud.get_by_email(db, email)
     if not user or not verify_password(payload.password, user.get("password_hash", "")):
@@ -54,22 +59,24 @@ async def login(request: Request, payload: LoginRequest, db = Depends(get_db)):
         raise AuthError("Invalid credentials")
 
     token = create_access_token(subject=user["_id"], extra_claims={"email": email})
-    # Return a small profile slice so the client can show a name immediately
     profile = {
         "user_id": user["_id"],
         "email": user["email"],
         "full_name": user.get("full_name"),
         "gender": user.get("gender"),
-        "voice_pref": user.get("voice_pref"),
+        # align with current schema: use voice_overrides instead of voice_pref
+        "voice_overrides": user.get("voice_overrides", {}),
     }
     return success({"token": token, "profile": profile})
 
+
 @router.get("/me")
-async def me(request: Request, current_user = Depends(get_current_user)):
+async def me(request: Request, current_user=Depends(get_current_user)):
     return success({
         "user_id": current_user["_id"],
         "email": current_user["email"],
         "full_name": current_user.get("full_name"),
         "gender": current_user.get("gender"),
-        "voice_pref": current_user.get("voice_pref"),
+        # align with current schema
+        "voice_overrides": current_user.get("voice_overrides", {}),
     })
