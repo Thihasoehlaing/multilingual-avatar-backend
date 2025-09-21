@@ -4,7 +4,6 @@ from app.config import settings
 from app.deps import get_current_user, get_db
 from app.users import crud as users_crud
 from app.users.models import UserUpdate
-from app.utils.avatar import avatar_for_gender
 from app.utils.errors import BadRequestError
 from app.utils.rate_limit import limiter
 from app.utils.response import success
@@ -21,8 +20,6 @@ async def get_me(request: Request, current_user=Depends(get_current_user)):
         "email": current_user["email"],
         "full_name": current_user.get("full_name"),
         "gender": gender,
-        "voice_overrides": current_user.get("voice_overrides", {}),
-        "avatar": avatar_for_gender(gender),
     })
 
 
@@ -49,13 +46,6 @@ async def update_me(
     if payload.gender is not None:
         updates["gender"] = payload.gender
 
-    # per-language voice overrides
-    if payload.voice_overrides is not None:
-        if not isinstance(payload.voice_overrides, dict):
-            raise BadRequestError("voice_overrides must be an object map of {lang: VoiceId}")
-        cleaned = {str(k): str(v).strip() for k, v in payload.voice_overrides.items() if str(v).strip()}
-        updates["voice_overrides"] = cleaned
-
     if not updates:
         raise BadRequestError("No changes provided")
 
@@ -68,6 +58,4 @@ async def update_me(
         "email": merged["email"],
         "full_name": merged.get("full_name"),
         "gender": gender,
-        "voice_overrides": merged.get("voice_overrides", {}),
-        "avatar": avatar_for_gender(gender),
     })

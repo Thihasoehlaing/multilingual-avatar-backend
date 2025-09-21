@@ -1,362 +1,438 @@
-from __future__ import annotations
-
-import base64
-import io
 import json
+import os
 import time
 import uuid
 from typing import Dict, List, Optional, Tuple
 
 import boto3
 from botocore.config import Config
-from botocore.exceptions import BotoCoreError, ClientError
+from fastapi import HTTPException, UploadFile
 
-from app.config import settings
+from app.tts.viseme_map import VISEME_MAP
 
+# ========= ENV / SETTINGS =========
 
-# =========================
-# Low-level AWS clients
-# =========================
+AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
+AWS_S3_BUCKET_AUDIO = os.getenv("AWS_S3_BUCKET_AUDIO", "avatar-ai-cache")
+S3_URL_EXPIRES_SECONDS = int(os.getenv("S3_URL_EXPIRES_SECONDS", "3600"))  # 1h link
 
-def _session_kwargs(region: str) -> Dict:
+def _normalize_bedrock_model_id(raw: Optional[str]) -> str:
+    model = (raw or "amazon.nova-pro-v1:0").strip()
+    if model.startswith("amazon.nova") and ":" not in model:
+        model += ":0"
+    return model
+
+BEDROCK_MODEL_ID = _normalize_bedrock_model_id(os.getenv("BEDROCK_MODEL_ID"))
+
+MAX_TTS_TEXT_LEN = int(os.getenv("MAX_TTS_TEXT_LEN", "500"))
+TRANSCRIBE_WAIT_TIMEOUT = int(os.getenv("TRANSCRIBE_WAIT_TIMEOUT", "45"))   # seconds
+TRANSCRIBE_POLL_INTERVAL = float(os.getenv("TRANSCRIBE_POLL_INTERVAL", "2.0"))
+NEURAL_ONLY_DEFAULT = os.getenv("NEURAL_ONLY_DEFAULT", "true").lower() == "true"
+
+_boto_cfg = Config(retries={"max_attempts": 6, "mode": "standard"})
+s3 = boto3.client("s3", region_name=AWS_REGION, config=_boto_cfg)
+polly = boto3.client("polly", region_name=AWS_REGION, config=_boto_cfg)
+transcribe = boto3.client("transcribe", region_name=AWS_REGION, config=_boto_cfg)
+bedrock = boto3.client("bedrock-runtime", region_name=AWS_REGION, config=_boto_cfg)
+
+# ========= VOICE SELECTION =========
+
+# near-locale fallback map for voices
+_NEAR_LOCALE = {
+    "zh-CN": ["zh-TW"], "zh-TW": ["zh-CN"],
+    "es-ES": ["es-MX"], "es-MX": ["es-ES"],
+    "en-GB": ["en-US"], "en-US": ["en-GB"],
+    "pt-BR": ["pt-PT"], "pt-PT": ["pt-BR"],
+}
+
+_DEFAULT_PRIORITY = [
+    "Matthew", "Joanna", "Takumi", "Mizuki", "Seoyeon", "Zhiyu",
+    "Amy", "Brian", "Emma", "Raveena", "Aditi", "Lupe", "Mia",
+]
+
+# Add this helper near your Polly section
+def _supports_neural(voice_id: str) -> bool:
     """
-    Build boto3 client kwargs using explicit creds from env/settings if provided.
-    Falls back to default provider chain (recommended in prod via instance/task roles).
+    Probe a Polly voice for Neural support (cheap 1-char synth).
+    Returns True if Neural works, else False.
     """
-    kw: Dict = {"region_name": region}
-    if settings.AWS_ACCESS_KEY_ID and settings.AWS_SECRET_ACCESS_KEY:
-        kw.update(
-            aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
-            aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
-            aws_session_token=settings.AWS_SESSION_TOKEN,
-        )
-    return kw
-
-
-def _polly():
-    return boto3.client(
-        "polly",
-        config=Config(retries={"max_attempts": 3, "mode": "standard"}),
-        **_session_kwargs(settings.AWS_REGION),
-    )
-
-
-def _translate():
-    return boto3.client(
-        "translate",
-        config=Config(retries={"max_attempts": 3, "mode": "standard"}),
-        **_session_kwargs(settings.AWS_REGION),
-    )
-
-
-def _s3():
-    return boto3.client(
-        "s3",
-        config=Config(retries={"max_attempts": 3, "mode": "standard"}),
-        **_session_kwargs(settings.AWS_REGION),
-    )
-
-
-def _transcribe():
-    return boto3.client(
-        "transcribe",
-        config=Config(retries={"max_attempts": 3, "mode": "standard"}),
-        **_session_kwargs(settings.AWS_REGION),
-    )
-
-
-# =========================
-# Polly voice catalog (cached + defensive)
-# =========================
-
-_VOICE_CACHE = {"ttl": 0, "data": []}
-_VOICE_TTL_SECONDS = 3600
-
-
-def list_polly_voices(lang: Optional[str] = None, require_neural: bool = True) -> List[Dict]:
-    """
-    Safely list voices. If AWS creds are expired/unavailable,
-    return the cached list (if any) or [] without raising exceptions.
-    """
-    now = int(time.time())
-    if now >= _VOICE_CACHE["ttl"]:
-        try:
-            polly = _polly()
-            token = None
-            voices: List[Dict] = []
-            while True:
-                resp = polly.describe_voices(NextToken=token) if token else polly.describe_voices()
-                for v in resp.get("Voices", []):
-                    voices.append(
-                        {
-                            "id": v["Id"],                                 # e.g., "Matthew"
-                            "gender": (v.get("Gender") or "").lower(),     # "male"/"female"
-                            "languages": [x for x in (v.get("LanguageCodes") or [])],
-                            "engines": [x for x in (v.get("SupportedEngines") or [])],
-                        }
-                    )
-                token = resp.get("NextToken")
-                if not token:
-                    break
-            _VOICE_CACHE["ttl"] = now + _VOICE_TTL_SECONDS
-            _VOICE_CACHE["data"] = voices
-        except (ClientError, BotoCoreError, Exception):
-            # keep cache (if any) and do not crash
-            pass
-
-    voices = list(_VOICE_CACHE["data"]) if _VOICE_CACHE["data"] else []
-    if lang:
-        voices = [v for v in voices if lang in (v.get("languages") or [])]
-    if require_neural:
-        voices = [v for v in voices if "neural" in (v.get("engines") or [])]
-    return sorted(voices, key=lambda v: (v.get("languages"), v.get("gender"), v["id"]))
-
-
-def is_voice_available(voice_id: str, lang: Optional[str] = None) -> bool:
     try:
-        voices = list_polly_voices(lang=lang, require_neural=False)
+        resp = polly.synthesize_speech(Text=".", VoiceId=voice_id, OutputFormat="mp3", Engine="neural")
+        # Drain/close stream to avoid leaking the socket
+        _ = resp["AudioStream"].read()
+        return True
     except Exception:
         return False
-    return any(v["id"] == voice_id for v in voices)
 
 
-def supported_languages() -> List[str]:
+def _list_polly_voices_by_lang(lang: str) -> List[Dict]:
+    out: List[Dict] = []
+    next_token: Optional[str] = None
+    try_specific = bool(lang)
+    while True:
+        try:
+            kwargs: Dict[str, str] = {"LanguageCode": lang} if try_specific else {}
+            if next_token:
+                kwargs["NextToken"] = next_token
+            resp = polly.describe_voices(**kwargs)
+        except Exception:
+            if not try_specific:
+                break
+            try_specific = False
+            continue
+        for v in resp.get("Voices", []):
+            out.append({
+                "id": v["Id"],
+                "gender": v.get("Gender", "Female").capitalize(),
+                "language_code": v.get("LanguageCode", lang),
+            })
+        next_token = resp.get("NextToken")
+        if not next_token:
+            break
+    return out
+
+def _pick_voice(target_lang: str, user_gender: Optional[str], neural_only: bool) -> Tuple[str, str]:
     """
-    Return a sorted list of Polly LanguageCodes available in this region,
-    derived from DescribeVoices.
-    Example: ["en-US","en-GB","zh-CN","yue-HK","ja-JP", ...]
+    Choose a Polly voice with preferences:
+      1) Match target_lang (with near-locale fallbacks)
+      2) Match user_gender if provided
+      3) Follow _DEFAULT_PRIORITY order
+      4) If neural_only: pick the first *neural-capable* voice from the pool.
+         If none are neural-capable, gracefully fall back to Standard using the top candidate.
+      5) If neural_only is False: prefer Neural if available (first that supports it),
+         else use Standard with the top candidate.
+    Returns: (voice_id, engine) where engine is "neural" or "standard".
     """
-    voices = list_polly_voices(lang=None, require_neural=False)
-    langs = set()
-    for v in voices:
-        for lc in v.get("languages") or []:
-            langs.add(lc)
-    return sorted(langs)
+    # Build candidate pool
+    locales = [target_lang] + _NEAR_LOCALE.get(target_lang, [])
+    candidates: List[Dict] = []
+    for lc in locales:
+        cand = _list_polly_voices_by_lang(lc)
+        if cand:
+            candidates = cand
+            break
+    if not candidates:
+        candidates = _list_polly_voices_by_lang("")
 
+    # Filter by gender (if provided), then sort by priority
+    pool = [c for c in candidates if user_gender and c["gender"].lower() == (user_gender or "").lower()] or candidates
+    pool.sort(key=lambda c: (_DEFAULT_PRIORITY.index(c["id"]) if c["id"] in _DEFAULT_PRIORITY else 999, c["id"]))
 
-def language_gender_availability() -> Dict[str, Dict[str, bool]]:
-    """
-    For each language, indicate whether male/female voices exist.
-    Returns: {"en-US":{"male":True,"female":True}, "zh-CN":{"male":False,"female":True}, ...}
-    """
-    info: Dict[str, Dict[str, bool]] = {}
-    all_voices = list_polly_voices(lang=None, require_neural=False)
-    for v in all_voices:
-        g = (v.get("gender") or "").lower()
-        for lc in v.get("languages") or []:
-            slot = info.setdefault(lc, {"male": False, "female": False})
-            if g in ("male", "female"):
-                slot[g] = True
-    return info
+    if not pool:
+        raise HTTPException(status_code=422, detail="No Polly voices available.")
 
+    # Try to find a neural-capable voice in order
+    for c in pool:
+        if _supports_neural(c["id"]):
+            return c["id"], "neural"
 
-# =========================
-# Language normalization for Translate
-# =========================
+    # No neural-capable voice found
+    top = pool[0]["id"]
+    if neural_only:
+        # User demanded neural, but none available → choose next available (Standard) instead of erroring
+        return top, "standard"
 
-_TRANSLATE_CODE_MAP = {
-    "en": "en", "en-US": "en", "en-GB": "en",
-    "ms": "ms", "ms-MY": "ms",
-    "zh": "zh", "zh-CN": "zh",
-    "yue": "yue", "yue-HK": "yue",   # Translate typically doesn't support Cantonese → we skip when 'yue'
-    "ja": "ja", "ja-JP": "ja",
-    "ko": "ko", "ko-KR": "ko",
-    "es": "es", "es-ES": "es",
-    "fr": "fr", "fr-FR": "fr",
-    "it": "it", "it-IT": "it",
-    "pt": "pt", "pt-PT": "pt",
-    "ru": "ru", "ru-RU": "ru",
-    "de": "de", "de-DE": "de",
-    "hi": "hi", "hi-IN": "hi",
-    "ta": "ta", "ta-IN": "ta",
-}
+    # Prefer Neural by default; fallback to Standard if none supported
+    return top, "standard"
 
-# Translate’s own supported set (subset)
-_TRANSLATE_SUPPORTED = {
-    "en","ms","zh","ja","ko","es","fr","it","pt","ru","de","hi","ta"
-}
+    return voice_id, "neural"  # will auto-fallback to standard in _synthesize_audio if needed
 
+# ========= BEDROCK TRANSLATION =========
 
-def _to_translate(code: Optional[str]) -> Optional[str]:
-    return _TRANSLATE_CODE_MAP.get(code, code) if code else None
-
-
-def translate_text(text: str, source_lang: Optional[str], target_lang: str) -> str:
-    """
-    Translate text from source_lang -> target_lang using Amazon Translate.
-    If target isn't supported by Translate (e.g., Cantonese 'yue'), return original text.
-    """
-    if not text:
-        return text
-    tl = _to_translate(target_lang)
-    sl = _to_translate(source_lang) or "auto"
-    if not tl or tl not in _TRANSLATE_SUPPORTED:
-        # Skip translation (e.g., yue-HK) — expect caller to supply target text already.
-        return text
-    resp = _translate().translate_text(Text=text, SourceLanguageCode=sl, TargetLanguageCode=tl)
-    return resp["TranslatedText"]
-
-
-# =========================
-# Voice selection (per-language, gender-aware)
-# =========================
-
-# Minimal, safe preferences (expand as you validate in your region)
-PREFERRED_VOICES: Dict[str, Dict[str, str]] = {
-    "en-US": {"male": "Matthew", "female": "Joanna"},
-    "en-GB": {"male": "Brian",   "female": "Emma"},
-    "zh-CN": {"female": "Zhiyu"},      # Mandarin often female-only per region
-    "yue-HK": {"female": "Hiujin"},    # Cantonese often female-only
-}
-
-def pick_voice_for(
-    target_lang: str,
-    user_gender: Optional[str],
-    voice_overrides: Optional[Dict[str, str]] = None,
-) -> Tuple[str, str]:
-    """
-    Decide the best Polly VoiceId for `target_lang`.
-    Order:
-      1) per-language override (if available & valid)
-      2) preferred per-language (gender-aware) if available
-      3) any neural voice in that language (prefer matching gender)
-      4) final fallback: global gender default (Matthew/Joanna)
-    Returns: (voice_id, reason) where reason ∈ {"override","preferred","any","fallback"}.
-    """
-    g = (user_gender or "").lower()
-    if g not in ("male", "female"):
-        g = None
-
-    langs = set(supported_languages())
-    lang_ok = target_lang in langs
-
-    # 1) per-language override
-    if voice_overrides and target_lang in voice_overrides:
-        vid = voice_overrides[target_lang]
-        if lang_ok and is_voice_available(vid, lang=target_lang):
-            return vid, "override"
-
-    # 2) preferred per-language
-    if lang_ok:
-        pref = PREFERRED_VOICES.get(target_lang) or {}
-        if g and pref.get(g) and is_voice_available(pref[g], lang=target_lang):
-            return pref[g], "preferred"
-        # try other gender if only one exists
-        for k in ("female", "male"):
-            if pref.get(k) and is_voice_available(pref[k], lang=target_lang):
-                return pref[k], "preferred"
-
-        # 3) any neural voice in that language (prefer same gender)
-        avail = list_polly_voices(lang=target_lang, require_neural=True)
-        if avail:
-            if g:
-                for v in avail:
-                    if (v.get("gender") or "").lower() == g:
-                        return v["id"], "any"
-            return avail[0]["id"], "any"
-
-    # 4) final fallback (language not supported or no neural voices)
-    fallback = settings.POLLY_VOICE_MALE if g == "male" else settings.POLLY_VOICE_FEMALE
-    return fallback, "fallback"
-
-
-# =========================
-# Transcribe (batch; short files)
-# =========================
-
-def transcribe_wav_bytes(
-    wav_bytes: bytes,
-    media_format: str,
-    language_code: str,
-    timeout_sec: int = 60,
-) -> str:
-    """
-    Upload to S3, start a batch TranscriptionJob, poll for completion,
-    then fetch the transcript from S3.
-    """
-    s3 = _s3()
-    transcribe = _transcribe()
-
-    ext = (media_format or "wav").lower()
-    key = f"transcribe/{uuid.uuid4().hex}.{ext}"
-    s3.put_object(
-        Bucket=settings.AWS_S3_BUCKET_AUDIO,
-        Key=key,
-        Body=wav_bytes,
-        ContentType=f"audio/{ext}",
+def translate_text_bedrock(text: str, src_lang: str, tgt_lang: str, style: Optional[str] = None) -> str:
+    if not text or not text.strip():
+        return ""
+    system = (
+        "You are a precise translation engine. Translate the user text exactly from the source language "
+        "to the target language, preserving meaning and tone. Return only the translated text."
     )
+    if style:
+        system += f" Style: {style}."
+    messages = [{
+        "role": "user",
+        "content": [{"text": f"Source language: {src_lang}\nTarget language: {tgt_lang}\nText:\n{text}"}]
+    }]
+    try:
+        resp = bedrock.converse(
+            modelId=BEDROCK_MODEL_ID,
+            messages=messages,
+            system=[{"text": system}],
+            inferenceConfig={"maxTokens": 1024, "temperature": 0.2, "topP": 0.9},
+        )
+        return resp["output"]["message"]["content"][0]["text"].strip()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Translation failed via Bedrock: {e}")
+
+# ========= S3 HELPERS =========
+
+def _s3_put(key: str, data: bytes, content_type: str, cache_control: Optional[str] = None) -> str:
+    kwargs = {"Bucket": AWS_S3_BUCKET_AUDIO, "Key": key, "Body": data, "ContentType": content_type}
+    if cache_control:
+        kwargs["CacheControl"] = cache_control
+    s3.put_object(**kwargs)
+    return f"s3://{AWS_S3_BUCKET_AUDIO}/{key}"
+
+def _s3_presigned_get(key: str, expires: int = S3_URL_EXPIRES_SECONDS) -> str:
+    return s3.generate_presigned_url(
+        "get_object",
+        Params={"Bucket": AWS_S3_BUCKET_AUDIO, "Key": key},
+        ExpiresIn=expires,
+    )
+
+def _s3_delete(key: str) -> None:
+    try:
+        s3.delete_object(Bucket=AWS_S3_BUCKET_AUDIO, Key=key)
+    except Exception:
+        pass
+
+def _s3_save_tts_audio(audio_bytes: bytes, lang: str, ext: str = "mp3") -> Tuple[str, str, str]:
+    key = f"tts/out/{lang}/{uuid.uuid4().hex}.{ext}"
+    s3_uri = _s3_put(key, audio_bytes, content_type="audio/mpeg", cache_control="public, max-age=86400")
+    url = _s3_presigned_get(key)
+    return key, s3_uri, url
+
+# ========= TRANSCRIBE (LEGACY: FILE) =========
+
+def transcribe_audio(file: UploadFile, lang_code_hint: Optional[str] = None) -> str:
+    content = file.file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="Empty audio file.")
+    if len(content) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Audio file too large (>10MB).")
+
+    ext = os.path.splitext(file.filename or "")[1].lower() or ".bin"
+    mime = file.content_type or "application/octet-stream"
+    in_key = f"transcribe/in/{uuid.uuid4().hex}{ext}"
+
+    _s3_put(in_key, content, mime)
+    s3_uri = f"s3://{AWS_S3_BUCKET_AUDIO}/{in_key}".replace(" ", "")
 
     job_name = f"job-{uuid.uuid4().hex}"
-    media_uri = f"s3://{settings.AWS_S3_BUCKET_AUDIO}/{key}"
+    kwargs: Dict = {
+        "TranscriptionJobName": job_name,
+        "Media": {"MediaFileUri": s3_uri},
+        "OutputBucketName": AWS_S3_BUCKET_AUDIO,
+    }
+    kwargs["LanguageCode"] = (lang_code_hint or "en-US")
 
-    transcribe.start_transcription_job(
-        TranscriptionJobName=job_name,
-        LanguageCode=language_code,
-        MediaFormat=ext,
-        Media={"MediaFileUri": media_uri},
-        OutputBucketName=settings.AWS_S3_BUCKET_AUDIO,
-        OutputKey=f"transcribe/{job_name}/",
-    )
+    try:
+        transcribe.start_transcription_job(**kwargs)
+    except Exception as e:
+        _s3_delete(in_key)
+        raise HTTPException(status_code=500, detail=f"Transcribe start failed: {e}")
 
-    start = time.time()
-    while True:
-        st = transcribe.get_transcription_job(TranscriptionJobName=job_name)
-        status = st["TranscriptionJob"]["TranscriptionJobStatus"]
+    t0 = time.time()
+    out_key: Optional[str] = None
+    while time.time() - t0 < TRANSCRIBE_WAIT_TIMEOUT:
+        job = transcribe.get_transcription_job(TranscriptionJobName=job_name)["TranscriptionJob"]
+        status = job["TranscriptionJobStatus"]
         if status == "COMPLETED":
+            resp = s3.list_objects_v2(Bucket=AWS_S3_BUCKET_AUDIO, Prefix=job_name)
+            for obj in resp.get("Contents", []):
+                if obj["Key"].endswith(".json"):
+                    out_key = obj["Key"]; break
             break
         if status == "FAILED":
-            raise RuntimeError(f"Transcription failed: {st}")
-        if time.time() - start > timeout_sec:
-            raise TimeoutError("Transcription timed out")
-        time.sleep(2.0)
+            _s3_delete(in_key)
+            raise HTTPException(status_code=422, detail=f"Transcription failed: {job.get('FailureReason')}")
+        time.sleep(TRANSCRIBE_POLL_INTERVAL)
 
-    out_key = f"transcribe/{job_name}/{job_name}.json"
-    obj = s3.get_object(Bucket=settings.AWS_S3_BUCKET_AUDIO, Key=out_key)
+    _s3_delete(in_key)
+    if not out_key:
+        raise HTTPException(status_code=504, detail="Transcription timed out.")
+
+    obj = s3.get_object(Bucket=AWS_S3_BUCKET_AUDIO, Key=out_key)
     data = json.loads(obj["Body"].read().decode("utf-8"))
-    text = data["results"]["transcripts"][0]["transcript"].strip()
-    return text
+    _s3_delete(out_key)
+    try:
+        return data["results"]["transcripts"][0]["transcript"].strip()
+    except Exception:
+        return ""
 
+# ========= TRANSCRIBE (S3 INPUT) =========
 
-# =========================
-# TTS + SpeechMarks (visemes)
-# =========================
+def transcribe_s3(bucket: str, key: str, lang_code_hint: Optional[str] = None) -> str:
+    if not bucket or not key:
+        raise HTTPException(status_code=400, detail="S3 bucket/key are required for transcription.")
 
-def synthesize_with_visemes(text: str, voice_id: str) -> Dict:
-    """
-    Synthesize `text` with Polly (neural MP3) and fetch SpeechMarks (visemes).
-    Returns: { audio_b64, mime, visemes: [{t, morph}] }
-    """
-    polly = _polly()
+    s3_uri = f"s3://{bucket}/{key}".replace(" ", "")
+    job_name = f"job-{uuid.uuid4().hex}"
 
-    # Audio
-    audio = polly.synthesize_speech(
-        Text=text,
-        VoiceId=voice_id,
-        Engine="neural",
-        OutputFormat="mp3",
+    kwargs: Dict = {
+        "TranscriptionJobName": job_name,
+        "Media": {"MediaFileUri": s3_uri},
+        "OutputBucketName": AWS_S3_BUCKET_AUDIO,
+    }
+    kwargs["LanguageCode"] = (lang_code_hint or "en-US")
+
+    try:
+        transcribe.start_transcription_job(**kwargs)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Transcribe start failed (S3): {e}")
+
+    t0 = time.time()
+    out_key: Optional[str] = None
+    while time.time() - t0 < TRANSCRIBE_WAIT_TIMEOUT:
+        job = transcribe.get_transcription_job(TranscriptionJobName=job_name)["TranscriptionJob"]
+        status = job["TranscriptionJobStatus"]
+        if status == "COMPLETED":
+            resp = s3.list_objects_v2(Bucket=AWS_S3_BUCKET_AUDIO, Prefix=job_name)
+            for obj in resp.get("Contents", []):
+                if obj["Key"].endswith(".json"):
+                    out_key = obj["Key"]; break
+            break
+        if status == "FAILED":
+            raise HTTPException(status_code=422, detail=f"Transcription failed: {job.get('FailureReason')}")
+        time.sleep(TRANSCRIBE_POLL_INTERVAL)
+
+    if not out_key:
+        raise HTTPException(status_code=504, detail="Transcription timed out (S3).")
+
+    obj = s3.get_object(Bucket=AWS_S3_BUCKET_AUDIO, Key=out_key)
+    data = json.loads(obj["Body"].read().decode("utf-8"))
+    _s3_delete(out_key)
+
+    try:
+        return data["results"]["transcripts"][0]["transcript"].strip()
+    except Exception:
+        return ""
+
+# ========= VISEMES =========
+
+def _map_visemes_to_shapes(visemes_raw: List[Dict]) -> List[Dict]:
+    return [{"time_ms": evt.get("time_ms", 0), "shape": VISEME_MAP.get(evt.get("viseme", ""), "AX")}
+            for evt in visemes_raw]
+
+# ========= POLLY =========
+
+def _synthesize_marks(text: str, voice_id: str, engine: str) -> List[Dict]:
+    resp = polly.synthesize_speech(
+        Text=text, VoiceId=voice_id, OutputFormat="json",
+        SpeechMarkTypes=["viseme"], Engine=engine,
     )
-    audio_bytes = audio["AudioStream"].read()
-
-    # SpeechMarks (visemes)
-    marks = polly.synthesize_speech(
-        Text=text,
-        VoiceId=voice_id,
-        Engine="neural",
-        OutputFormat="json",
-        SpeechMarkTypes=["viseme"],
-    )
-
-    visemes: List[Dict] = []
-    for line in io.TextIOWrapper(marks["AudioStream"], encoding="utf-8"):
+    out: List[Dict] = []
+    for line in resp["AudioStream"].read().decode("utf-8").splitlines():
         try:
-            obj = json.loads(line.strip())
-            # "time" (ms), "value" (viseme label)
-            visemes.append({"t": obj.get("time", 0) / 1000.0, "morph": obj.get("value")})
+            evt = json.loads(line)
+            if evt.get("type") == "viseme":
+                out.append({"time_ms": evt.get("time", 0), "viseme": evt.get("value", "")})
         except Exception:
             continue
+    return out
 
-    return {
-        "audio_b64": base64.b64encode(audio_bytes).decode("utf-8"),
-        "mime": "audio/mpeg",
-        "visemes": visemes,
+def _synthesize_audio(text: str, voice_id: str, engine: str, sample_rate_hz: int) -> bytes:
+    try:
+        resp = polly.synthesize_speech(
+            Text=text, VoiceId=voice_id, OutputFormat="mp3",
+            Engine=engine, SampleRate=str(sample_rate_hz),
+        )
+        return resp["AudioStream"].read()
+    except Exception:
+        if engine == "neural":
+            resp = polly.synthesize_speech(
+                Text=text, VoiceId=voice_id, OutputFormat="mp3",
+                Engine="standard", SampleRate=str(sample_rate_hz),
+            )
+            return resp["AudioStream"].read()
+        raise
+
+def synthesize_with_visemes(
+    text: str,
+    target_lang: str,
+    user_gender: Optional[str],
+    neural_only: bool,
+    sample_rate_hz: int = 22050,
+) -> Tuple[bytes, List[Dict]]:
+    voice_id, engine = _pick_voice(target_lang, user_gender, neural_only)
+    audio_bytes = _synthesize_audio(text, voice_id, engine, sample_rate_hz)
+    visemes_raw = _synthesize_marks(text, voice_id, engine)
+    return audio_bytes, visemes_raw
+
+# ========= PIPELINES =========
+
+def pipeline_text(
+    text: str,
+    current_lang: str,
+    target_lang: str,
+    user_gender: Optional[str] = None,
+    style: Optional[str] = None,
+    neural_only: Optional[bool] = None,
+    sample_rate_hz: Optional[int] = None,
+    include_visemes_raw: bool = False,
+    return_transcript: bool = False,
+) -> Dict:
+    if not text or not text.strip():
+        raise HTTPException(status_code=400, detail="Text is required.")
+    if len(text) > MAX_TTS_TEXT_LEN:
+        raise HTTPException(status_code=400, detail=f"Text too long (>{MAX_TTS_TEXT_LEN} chars).")
+
+    translated = translate_text_bedrock(text, current_lang, target_lang, style=style)
+
+    audio_bytes, visemes_raw = synthesize_with_visemes(
+        translated,
+        target_lang,
+        user_gender,
+        neural_only if neural_only is not None else NEURAL_ONLY_DEFAULT,
+        sample_rate_hz or 22050,
+    )
+
+    _, _, audio_s3_url = _s3_save_tts_audio(audio_bytes, target_lang)
+
+    resp: Dict = {
+        "s3_url": audio_s3_url,
+        "visemes_mapped": _map_visemes_to_shapes(visemes_raw),
+        "source_text": text,               # original input text
+        "translated_text": translated,     # translated text (used for TTS)
     }
+    if include_visemes_raw:
+        resp["visemes_raw"] = visemes_raw
+    if return_transcript:
+        resp["transcript"] = text  # for text pipeline, transcript == source_text
+    return resp
+
+def pipeline_voice(
+    bucket: str,
+    key: str,
+    current_lang: str,
+    target_lang: str,
+    user_gender: Optional[str] = None,
+    style: Optional[str] = None,
+    neural_only: Optional[bool] = None,
+    sample_rate_hz: Optional[int] = None,
+    include_visemes_raw: bool = False,
+    return_transcript: bool = True,
+) -> Dict:
+    """
+    Voice pipeline (S3):
+    1) Transcribe from S3
+    2) Translate via Bedrock
+    3) Synthesize with Polly (+ visemes)
+    4) Save to S3 and return presigned URL + visemes
+    """
+    transcript = transcribe_s3(bucket, key, lang_code_hint=current_lang)
+    if not transcript:
+        raise HTTPException(status_code=422, detail="Transcribe returned empty transcript (S3).")
+
+    translated = translate_text_bedrock(transcript, current_lang, target_lang, style=style)
+
+    audio_bytes, visemes_raw = synthesize_with_visemes(
+        translated,
+        target_lang,
+        user_gender,
+        neural_only if neural_only is not None else NEURAL_ONLY_DEFAULT,
+        sample_rate_hz or 22050,
+    )
+
+    _, _, audio_s3_url = _s3_save_tts_audio(audio_bytes, target_lang)
+
+    resp: Dict = {
+        "s3_url": audio_s3_url,
+        "visemes_mapped": _map_visemes_to_shapes(visemes_raw),
+        "source_text": transcript,   # original speech transcript
+        "translated_text": translated,     # translated text (used for TTS)
+    }
+    if include_visemes_raw:
+        resp["visemes_raw"] = visemes_raw
+    if return_transcript:
+        resp["transcript"] = transcript
+    return resp

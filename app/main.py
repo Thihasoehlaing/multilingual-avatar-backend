@@ -27,7 +27,8 @@ from app.utils.errors import (
 from app.auth.routes import router as auth_router
 from app.users.routes import router as users_router
 from app.tts.routes import router as tts_router
-from app.avatar.routes import router as avatar_router
+from app.voice.routes import router as voice_router
+from app.tts.routes_languages import router as languages_router
 
 def create_app() -> FastAPI:
     app = FastAPI(
@@ -110,8 +111,9 @@ def create_app() -> FastAPI:
     app.include_router(auth_router, prefix="/auth", tags=["auth"])
     app.include_router(users_router)             # /users/me, /users/me (PATCH)
     app.include_router(tts_router)               # /tts/voices, /tts/choose, /tts/say
-    app.include_router(avatar_router)            # /avatar/config, /avatar/speak/*
-
+    app.include_router(voice_router)
+    app.include_router(languages_router, prefix="/languages", tags=["languages"])  # /languages/current, /languages/target
+    
     return app
 
 app = create_app()

@@ -25,8 +25,6 @@ async def insert_user(
         "password_hash": password_hash,
         "full_name": full_name,
         "gender": None,
-        # Per-language Polly voices; keep empty dict by default
-        "voice_overrides": {},
         "created_at": now,
         "updated_at": now,
     }

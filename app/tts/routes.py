@@ -1,48 +1,106 @@
-from __future__ import annotations
-from typing import Optional
-from fastapi import APIRouter, Depends
+# app/tts/routes.py
+from fastapi import APIRouter, HTTPException, UploadFile, File, Form
 from pydantic import BaseModel, Field
+from typing import Optional, List, Dict, Any
+from starlette.concurrency import run_in_threadpool
 
-from app.deps import get_current_user
-from app.utils.response import success, fail
-from app.users.crud import update_profile
-from app.config import settings
-from .services import (
-    list_polly_voices,
-    is_voice_available,
-    translate_text,
-    synthesize_with_visemes,
-)
+from app.utils.response import success
+from app.tts import services  # provides pipeline_text / pipeline_voice
 
 router = APIRouter(prefix="/tts", tags=["tts"])
 
-class SayIn(BaseModel):
-    text: str = Field(..., max_length=settings.MAX_TTS_TEXT_LEN)
-    current_lang: Optional[str] = None
+
+# ==== Schemas ====
+
+class SpeakTextRequest(BaseModel):
+    text: str = Field(..., min_length=1)
+    current_lang: str
     target_lang: str
+    style: Optional[str] = None
+    neural_only: Optional[bool] = None
+    sample_rate_hz: Optional[int] = None
+    return_transcript: bool = False
 
-@router.get("/voices")
-async def get_voices(lang: Optional[str] = None, neural_only: bool = True, current_user=Depends(get_current_user)):
-    return success({"voices": list_polly_voices(lang=lang, require_neural=neural_only)})
 
-@router.post("/choose")
-async def choose_voice(voice_id: str, lang: Optional[str] = None, current_user=Depends(get_current_user)):
-    if not is_voice_available(voice_id, lang=lang):
-        return fail("VOICE_NOT_AVAILABLE", f"Voice '{voice_id}' not available in this region.")
-    await update_profile(current_user["_db"], current_user["_id"], {"voice_pref": voice_id})
-    return success({"voice_pref": voice_id})
+class SpeakVoiceS3Request(BaseModel):
+    bucket: str
+    key: str
+    current_lang: str
+    target_lang: str
+    return_transcript: bool = True
 
-@router.post("/say")
-async def say(body: SayIn, current_user=Depends(get_current_user)):
-    # Translate (if needed) from current_lang to target_lang
-    text_t = translate_text(body.text.strip(), source_lang=body.current_lang, target_lang=body.target_lang)
 
-    # pick voice: user preference → gender default
-    voice = current_user.get("voice_pref")
-    if not voice:
-        voice = settings.POLLY_VOICE_MALE if current_user.get("gender") == "male" else settings.POLLY_VOICE_FEMALE
-    if not is_voice_available(voice, lang=body.target_lang):
-        voice = settings.POLLY_VOICE_FEMALE
+class VisemeMapped(BaseModel):
+    time_ms: int
+    shape: str
 
-    out = synthesize_with_visemes(text_t, voice_id=voice)
-    return success(out)
+
+class SpeakResponse(BaseModel):
+    s3_url: Optional[str] = None
+    visemes_mapped: List[VisemeMapped] = []
+    visemes_raw: Optional[List[Dict[str, Any]]] = None
+    transcript: Optional[str] = None
+    audio_b64: Optional[str] = None
+    audio_mime: Optional[str] = None
+    sample_rate_hz: Optional[int] = None
+    engine: Optional[str] = None
+    debug: Optional[Dict[str, Any]] = None
+    duration_ms: Optional[int] = None
+    source_text: Optional[str] = None
+    translated_text: Optional[str] = None
+
+
+# ==== Routes ====
+
+@router.post("/speak/text", response_model=Dict[str, Any])
+async def speak_text(payload: SpeakTextRequest):
+    try:
+        # run sync pipeline in a worker thread (no 'await' on the function itself)
+        result = await run_in_threadpool(
+            services.pipeline_text,
+            text=payload.text,
+            current_lang=payload.current_lang,
+            target_lang=payload.target_lang,
+            style=payload.style,
+            neural_only=payload.neural_only,
+            sample_rate_hz=payload.sample_rate_hz,
+            return_transcript=payload.return_transcript,
+        )
+        return success(result)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"text pipeline failed: {e}")
+
+
+@router.post("/speak/voice-s3", response_model=Dict[str, Any])
+async def speak_voice_from_s3(payload: SpeakVoiceS3Request):
+    try:
+        result = await run_in_threadpool(
+            services.pipeline_voice,
+            bucket=payload.bucket,
+            key=payload.key,
+            current_lang=payload.current_lang,
+            target_lang=payload.target_lang,
+            return_transcript=payload.return_transcript,
+        )
+        return success(result)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"voice-s3 pipeline failed: {e}")
+
+
+# ---- (Optional) Deprecated legacy endpoint: multipart file upload) ----
+@router.post("/speak/voice", response_model=Dict[str, Any], deprecated=True)
+async def speak_voice_legacy(
+    voice_file: UploadFile = File(..., description="Deprecated: use /tts/speak/voice-s3"),
+    current_language: str = Form(...),
+    target_language: str = Form(...),
+    return_transcript: bool = Form(True),
+):
+    try:
+        # If you still want this to work, you can stream the file to S3 here,
+        # then call the same services.pipeline_voice(bucket, key, ...)
+        # Or just raise to force migration:
+        raise HTTPException(status_code=410, detail="Use /tts/speak/voice-s3 with S3 bucket/key.")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"legacy voice pipeline failed: {e}")
